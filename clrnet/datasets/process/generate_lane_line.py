@@ -58,7 +58,7 @@ class GenerateLaneLine(object):
 
     def sample_lane(self, points, sample_ys):
         # this function expects the points to be sorted
-        points = np.array(points)
+        points = np.array(points)  # [N, 2]
         if not np.all(points[1:, 1] < points[:-1, 1]):
             raise Exception('Annotaion points have to be sorted')
         x, y = points[:, 0], points[:, 1]
@@ -124,8 +124,8 @@ class GenerateLaneLine(object):
         ) * -1e5  # 2 scores, 1 start_y, 1 start_x, 1 theta, 1 length, S+1 coordinates
         lanes_endpoints = np.ones((self.max_lanes, 2))
         # lanes are invalid by default
-        lanes[:, 0] = 1
-        lanes[:, 1] = 0
+        lanes[:, 0] = 1  # cls0: no lane
+        lanes[:, 1] = 0  # cls1: has lane
         for lane_idx, lane in enumerate(old_lanes):
             if lane_idx >= self.max_lanes:
                 break
@@ -138,10 +138,10 @@ class GenerateLaneLine(object):
             if len(xs_inside_image) <= 1:
                 continue
             all_xs = np.hstack((xs_outside_image, xs_inside_image))
-            lanes[lane_idx, 0] = 0
-            lanes[lane_idx, 1] = 1
-            lanes[lane_idx, 2] = len(xs_outside_image) / self.n_strips
-            lanes[lane_idx, 3] = xs_inside_image[0]
+            lanes[lane_idx, 0] = 0  # prob of no lane
+            lanes[lane_idx, 1] = 1  # prob of lane
+            lanes[lane_idx, 2] = len(xs_outside_image) / self.n_strips  # start_y
+            lanes[lane_idx, 3] = xs_inside_image[0]  # start_x
 
             thetas = []
             for i in range(1, len(xs_inside_image)):
@@ -155,7 +155,7 @@ class GenerateLaneLine(object):
 
             # lanes[lane_idx,
             #       4] = (theta_closest + theta_far) / 2  # averaged angle
-            lanes[lane_idx, 4] = theta_far
+            lanes[lane_idx, 4] = theta_far  # averaged angle
             lanes[lane_idx, 5] = len(xs_inside_image)
             lanes[lane_idx, 6:6 + len(all_xs)] = all_xs
             lanes_endpoints[lane_idx, 0] = (len(all_xs) - 1) / self.n_strips

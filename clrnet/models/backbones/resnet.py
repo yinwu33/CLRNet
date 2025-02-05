@@ -177,10 +177,11 @@ class ResNetWrapper(nn.Module):
                                cfg.featuremap_out_channel)
 
     def forward(self, x):
+        # x: [B, 3, 320, 800]
         x = self.model(x)
         if self.out:
             x[-1] = self.out(x[-1])
-        return x
+        return x  # 4 outputs: [B, 64, 80, 200], [B, 128, 40, 100], [B, 256, 20, 50], [B, 512, 10, 25]
 
 
 class ResNet(nn.Module):

@@ -16,27 +16,16 @@ LIST_FILE = {
     "test": "list/test.txt",
 }
 
-CATEGORYS = {
-    "normal": "list/test_split/test0_normal.txt",
-    "crowd": "list/test_split/test1_crowd.txt",
-    "hlight": "list/test_split/test2_hlight.txt",
-    "shadow": "list/test_split/test3_shadow.txt",
-    "noline": "list/test_split/test4_noline.txt",
-    "arrow": "list/test_split/test5_arrow.txt",
-    "curve": "list/test_split/test6_curve.txt",
-    "cross": "list/test_split/test7_cross.txt",
-    "night": "list/test_split/test8_night.txt",
-}
 
 
 @DATASETS.register_module
-class CULane(BaseDataset):
+class TuSimpleRe(BaseDataset):
     def __init__(
         self,
         data_root,
         split,
         ori_img_size,
-        sample_y=range(589, 230, -20),
+        sample_y=range(710, 150, -10),
         processes=None,
         cfg=None,
     ):
@@ -56,7 +45,7 @@ class CULane(BaseDataset):
         self.logger.info("Loading CULane annotations...")
         # Waiting for the dataset to load is tedious, let's cache it
         os.makedirs("cache", exist_ok=True)
-        cache_path = "cache/culane_{}.pkl".format(self.split)
+        cache_path = "cache/tusimplere_{}.pkl".format(self.split)
         if os.path.exists(cache_path):
             with open(cache_path, "rb") as cache_file:
                 self.data_infos = pkl.load(cache_file)

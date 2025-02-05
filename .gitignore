@@ -1,5 +1,7 @@
-work_dirs
-data
+work_dirs/
+configs/
+data/
+weights/
 cache/
 
 __pycache__/

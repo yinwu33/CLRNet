@@ -17,6 +17,7 @@ metric is used.
 import os
 import argparse
 from functools import partial
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -26,6 +27,7 @@ from scipy.optimize import linear_sum_assignment
 from shapely.geometry import LineString, Polygon
 
 import clrnet.utils.llamas_utils as llamas_utils
+from clrnet.datasets.base_dataset import resize_lanes
 
 LLAMAS_IMG_RES = (717, 1276)
 
@@ -47,8 +49,29 @@ def draw_lane(lane, img=None, img_shape=None, width=30):
         img = np.zeros(img_shape, dtype=np.uint8)
     lane = lane.astype(np.int32)
     for p1, p2 in zip(lane[:-1], lane[1:]):
-        cv2.line(img, tuple(p1), tuple(p2), color=(1, ), thickness=width)
+        cv2.line(img, tuple(p1), tuple(p2), color=(1,), thickness=width)
     return img
+
+
+def discrete_max_iou(pred, anno, width=30, img_shape=(717, 1276, 3)):  # TODO
+    if len(pred) == 0:
+        return []
+
+    ious = [0 for _ in range(len(pred))]
+
+    xs = [draw_lane(lane, img_shape=img_shape, width=width) > 0 for lane in pred]
+    ys = [draw_lane(lane, img_shape=img_shape, width=width) > 0 for lane in anno]
+
+    for i, x in enumerate(xs):
+        max_iou = ious[i]
+        for y in ys:
+            iou = (x & y).sum() / (x | y).sum()
+
+            max_iou = max(max_iou, iou)
+
+        ious[i] = max_iou
+
+    return ious
 
 
 def discrete_cross_iou(xs, ys, width=30, img_shape=LLAMAS_IMG_RES):
@@ -62,7 +85,21 @@ def discrete_cross_iou(xs, ys, width=30, img_shape=LLAMAS_IMG_RES):
         for j, y in enumerate(ys):
             # IoU by the definition: sum all intersections (binary and) and divide by the sum of the union (binary or)
             ious[i, j] = (x & y).sum() / (x | y).sum()
-    return ious
+
+    if len(xs) == 0 and len(ys) != 0:
+        return ious, 0
+    elif len(xs) == 0 and len(ys) == 0:
+        return ious, 1
+    elif len(xs) != 0 and len(ys) == 0:
+        return ious, 0
+    else:
+        total_x = np.stack(xs).sum(axis=0)
+        total_y = np.stack(ys).sum(axis=0)
+        intersection = (total_x & total_y).sum()
+        union = (total_x | total_y).sum()
+        total_iou = intersection / union if union != 0 else 0
+
+        return ious, total_iou
 
 
 def continuous_cross_iou(xs, ys, width=30, img_shape=LLAMAS_IMG_RES):
@@ -71,13 +108,15 @@ def continuous_cross_iou(xs, ys, width=30, img_shape=LLAMAS_IMG_RES):
     h, w = img_shape
     image = Polygon([(0, 0), (0, h - 1), (w - 1, h - 1), (w - 1, 0)])
     xs = [
-        LineString(lane).buffer(distance=width / 2., cap_style=1,
-                                join_style=2).intersection(image)
+        LineString(lane)
+        .buffer(distance=width / 2.0, cap_style=1, join_style=2)
+        .intersection(image)
         for lane in xs
     ]
     ys = [
-        LineString(lane).buffer(distance=width / 2., cap_style=1,
-                                join_style=2).intersection(image)
+        LineString(lane)
+        .buffer(distance=width / 2.0, cap_style=1, join_style=2)
+        .intersection(image)
         for lane in ys
     ]
 
@@ -95,16 +134,21 @@ def interpolate_lane(points, n=50):
     y = [y for _, y in points]
     tck, _ = splprep([x, y], s=0, t=n, k=min(3, len(points) - 1))
 
-    u = np.linspace(0., 1., n)
+    u = np.linspace(0.0, 1.0, n)
     return np.array(splev(u, tck)).T
 
 
-def culane_metric(pred,
-                  anno,
-                  width=30,
-                  iou_thresholds=[0.5],
-                  unofficial=False,
-                  img_shape=LLAMAS_IMG_RES):
+def culane_metric(
+    pred,
+    anno,
+    width=30,
+    iou_thresholds=[0.5],
+    unofficial=False,
+    img_shape=LLAMAS_IMG_RES,
+    model_img_size=LLAMAS_IMG_RES,
+):
+    # model_img_size:(h, w) the ori_img_size used in model, for cross-dataset evaluation
+
     _metric = {}
     for thr in iou_thresholds:
         tp = 0
@@ -113,30 +157,33 @@ def culane_metric(pred,
         _metric[thr] = [tp, fp, fn]
 
     """Computes CULane's metric for a single image"""
-    if len(pred) == 0:
-        return 0, 0, len(anno), _metric
-    if len(anno) == 0:
-        return 0, len(pred), 0, _metric
 
-    interp_pred = np.array([
-        interpolate_lane(pred_lane, n=50) for pred_lane in pred
-    ])  # (4, 50, 2)
+    interp_pred = np.array(
+        [interpolate_lane(pred_lane, n=50) for pred_lane in pred]
+    )  # (4, 50, 2)
+
     anno = np.array([np.array(anno_lane) for anno_lane in anno], dtype=object)
 
     if unofficial:
         ious = continuous_cross_iou(interp_pred, anno, width=width)
     else:
-        ious = discrete_cross_iou(interp_pred,
-                                  anno,
-                                  width=width,
-                                  img_shape=img_shape)
+        ious, image_iou = discrete_cross_iou(
+            interp_pred, anno, width=width, img_shape=img_shape
+        )
+
     row_ind, col_ind = linear_sum_assignment(1 - ious)
+
     _metric = {}
+
     for thr in iou_thresholds:
         tp = int((ious[row_ind, col_ind] > thr).sum())
         fp = len(pred) - tp
         fn = len(anno) - tp
         _metric[thr] = [tp, fp, fn]
+
+    _metric["ious"] = discrete_max_iou(interp_pred, anno, width=width)
+
+    _metric["image_iou"] = image_iou
 
     return _metric
 
@@ -145,12 +192,13 @@ def load_prediction(path):
     """Loads an image's predictions
     Returns a list of lanes, where each lane is a list of points (x,y)
     """
-    with open(path, 'r') as data_file:
+    with open(path, "r") as data_file:
         img_data = data_file.readlines()
     img_data = [line.split() for line in img_data]
     img_data = [list(map(float, lane)) for lane in img_data]
-    img_data = [[(lane[i], lane[i + 1]) for i in range(0, len(lane), 2)]
-                for lane in img_data]
+    img_data = [
+        [(lane[i], lane[i + 1]) for i in range(0, len(lane), 2)] for lane in img_data
+    ]
     img_data = [lane for lane in img_data if len(lane) >= 2]
 
     return img_data
@@ -158,8 +206,7 @@ def load_prediction(path):
 
 def load_prediction_list(label_paths, pred_dir):
     return [
-        load_prediction(
-            os.path.join(pred_dir, path.replace('.json', '.lines.txt')))
+        load_prediction(os.path.join(pred_dir, path.replace(".json", ".lines.txt")))
         for path in label_paths
     ]
 
@@ -168,11 +215,11 @@ def load_labels(label_dir):
     """Loads the annotations and its paths
     Each annotation is converted to a list of points (x, y)
     """
-    label_paths = llamas_utils.get_files_from_folder(label_dir, '.json')
+    label_paths = llamas_utils.get_files_from_folder(label_dir, ".json")
     annos = [
         [
-            add_ys(xs) for xs in
-            llamas_utils.get_horizontal_values_for_four_lanes(label_path)
+            add_ys(xs)
+            for xs in llamas_utils.get_horizontal_values_for_four_lanes(label_path)
             if (np.array(xs) >= 0).sum() > 1
         ]  # lanes annotated with a single point are ignored
         for label_path in label_paths
@@ -181,51 +228,86 @@ def load_labels(label_dir):
     return np.array(annos, dtype=object), np.array(label_paths, dtype=object)
 
 
-def eval_predictions(pred_dir,
-                     anno_dir,
-                     width=30,
-                     iou_thresholds=[0.5],
-                     unofficial=True,
-                     sequential=False):
+def eval_predictions(
+    pred_dir,
+    anno_dir,
+    width=30,
+    iou_thresholds=[0.5],
+    unofficial=True,
+    sequential=False,
+    model_img_size=None,
+    cfg=None,
+):
     """Evaluates the predictions in pred_dir and returns CULane's metrics (precision, recall, F1 and its components)"""
-    print(f'Loading annotation data ({anno_dir})...')
-    os.makedirs('cache', exist_ok=True)
-    annotations_path = 'cache/llamas_annotations.pkl'
-    label_path = 'cache/llamas_label_paths.pkl'
+    print(f"Loading annotation data ({anno_dir})...")
+    os.makedirs("cache", exist_ok=True)
+    
+    split = cfg.dataset.val.split
+    annotations_path = f"cache/llamas_annotations_{split}.pkl"
+    label_path = f"cache/llamas_label_paths_{split}.pkl"
     import pickle as pkl
+
     if os.path.exists(annotations_path) and os.path.exists(label_path):
-        with open(annotations_path, 'rb') as cache_file:
+        with open(annotations_path, "rb") as cache_file:
             annotations = pkl.load(cache_file)
-        with open(label_path, 'rb') as cache_file:
+        with open(label_path, "rb") as cache_file:
             label_paths = pkl.load(cache_file)
     else:
         annotations, label_paths = load_labels(anno_dir)
-        with open(annotations_path, 'wb') as cache_file:
+        with open(annotations_path, "wb") as cache_file:
             pkl.dump(annotations, cache_file)
-        with open(label_path, 'wb') as cache_file:
+        with open(label_path, "wb") as cache_file:
             pkl.dump(label_paths, cache_file)
-        
-    print(f'Loading prediction data ({pred_dir})...')
+
+    print(f"Loading prediction data ({pred_dir})...")
     predictions = load_prediction_list(label_paths, pred_dir)
-    print('Calculating metric {}...'.format(
-        'sequentially' if sequential else 'in parallel'))
+    print(
+        "Calculating metric {}...".format(
+            "sequentially" if sequential else "in parallel"
+        )
+    )
     if sequential:
         results = map(
-            partial(culane_metric,
-                    width=width,
-                    unofficial=unofficial,
-                    img_shape=LLAMAS_IMG_RES), predictions, annotations)
+            partial(
+                culane_metric,
+                width=width,
+                unofficial=unofficial,
+                img_shape=LLAMAS_IMG_RES,
+                model_img_size=model_img_size,
+            ),
+            predictions,
+            annotations,
+        )
     else:
         from multiprocessing import Pool, cpu_count
         from itertools import repeat
+
         with Pool(cpu_count()) as p:
-            results = p.starmap(culane_metric, zip(predictions, annotations,
-                        repeat(width),
-                        repeat(iou_thresholds),
-                        repeat(unofficial),
-                        repeat(LLAMAS_IMG_RES)))
+            results = p.starmap(
+                culane_metric,
+                zip(
+                    predictions,
+                    annotations,
+                    repeat(width),
+                    repeat(iou_thresholds),
+                    repeat(unofficial),
+                    repeat(LLAMAS_IMG_RES),
+                    repeat(model_img_size),
+                ),
+            )
+
+    # ! save the results
+    save_path = Path("eval_results.pkl")
+    if cfg is not None:
+        save_path = Path(cfg.work_dir) / save_path
+
+    with open(save_path, "wb") as f:
+        pkl.dump(results, f)
+
+    # ! end
 
     import logging
+
     logger = logging.getLogger(__name__)
     mean_f1, mean_prec, mean_recall, total_tp, total_fp, total_fn = 0, 0, 0, 0, 0, 0
     ret = {}
@@ -235,10 +317,13 @@ def eval_predictions(pred_dir,
         fn = sum(m[thr][2] for m in results)
         precision = float(tp) / (tp + fp) if tp != 0 else 0
         recall = float(tp) / (tp + fn) if tp != 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if tp !=0 else 0
-        logger.info('iou thr: {:.2f}, tp: {}, fp: {}, fn: {}, '
-                'precision: {}, recall: {}, f1: {}'.format(
-            thr, tp, fp, fn, precision, recall, f1))
+        f1 = 2 * precision * recall / (precision + recall) if tp != 0 else 0
+        logger.info(
+            "iou thr: {:.2f}, tp: {}, fp: {}, fn: {}, "
+            "precision: {}, recall: {}, f1: {}".format(
+                thr, tp, fp, fn, precision, recall, f1
+            )
+        )
         mean_f1 += f1 / len(iou_thresholds)
         mean_prec += precision / len(iou_thresholds)
         mean_recall += recall / len(iou_thresholds)
@@ -246,70 +331,80 @@ def eval_predictions(pred_dir,
         total_fp += fp
         total_fn += fn
         ret[thr] = {
-            'TP': tp,
-            'FP': fp,
-            'FN': fn,
-            'Precision': precision,
-            'Recall': recall,
-            'F1': f1
+            "TP": tp,
+            "FP": fp,
+            "FN": fn,
+            "Precision": precision,
+            "Recall": recall,
+            "F1": f1,
         }
     if len(iou_thresholds) > 2:
-        logger.info('mean result, total_tp: {}, total_fp: {}, total_fn: {},'
-                'precision: {}, recall: {}, f1: {}'.format(total_tp, total_fp,
-            total_fn, mean_prec, mean_recall, mean_f1))
-        ret['mean'] = {
-            'TP': total_tp,
-            'FP': total_fp,
-            'FN': total_fn,
-            'Precision': mean_prec,
-            'Recall': mean_recall,
-            'F1': mean_f1
+        logger.info(
+            "mean result, total_tp: {}, total_fp: {}, total_fn: {},"
+            "precision: {}, recall: {}, f1: {}".format(
+                total_tp, total_fp, total_fn, mean_prec, mean_recall, mean_f1
+            )
+        )
+        ret["mean"] = {
+            "TP": total_tp,
+            "FP": total_fp,
+            "FN": total_fn,
+            "Precision": mean_prec,
+            "Recall": mean_recall,
+            "F1": mean_f1,
         }
     return ret
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Measure CULane's metric on the LLAMAS dataset")
+        description="Measure CULane's metric on the LLAMAS dataset"
+    )
     parser.add_argument(
         "--pred_dir",
         help="Path to directory containing the predicted lanes",
-        required=True)
+        required=True,
+    )
     parser.add_argument(
         "--anno_dir",
         help="Path to directory containing the annotated lanes",
-        required=True)
-    parser.add_argument("--width",
-                        type=int,
-                        default=30,
-                        help="Width of the lane")
-    parser.add_argument("--sequential",
-                        action='store_true',
-                        help="Run sequentially instead of in parallel")
-    parser.add_argument("--unofficial",
-                        action='store_true',
-                        help="Use a faster but unofficial algorithm")
+        required=True,
+    )
+    parser.add_argument("--width", type=int, default=30, help="Width of the lane")
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Run sequentially instead of in parallel",
+    )
+    parser.add_argument(
+        "--unofficial",
+        action="store_true",
+        help="Use a faster but unofficial algorithm",
+    )
 
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    results = eval_predictions(args.pred_dir,
-                               args.anno_dir,
-                               width=args.width,
-                               iou_thresholds=[0.5],
-                               unofficial=args.unofficial,
-                               sequential=args.sequential)
+    results = eval_predictions(
+        args.pred_dir,
+        args.anno_dir,
+        width=args.width,
+        iou_thresholds=[0.5],
+        unofficial=args.unofficial,
+        sequential=args.sequential,
+    )
 
-    header = '=' * 20 + ' Results' + '=' * 20
+    header = "=" * 20 + " Results" + "=" * 20
     print(header)
     for metric, value in results.items():
         if isinstance(value, float):
-            print('{}: {:.4f}'.format(metric, value))
+            print("{}: {:.4f}".format(metric, value))
         else:
-            print('{}: {}'.format(metric, value))
-    print('=' * len(header))
+            print("{}: {}".format(metric, value))
+    print("=" * len(header))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

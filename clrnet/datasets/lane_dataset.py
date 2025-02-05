@@ -3,7 +3,7 @@ import os.path as osp
 import numpy as np
 from .base_dataset import BaseDataset
 from .registry import DATASETS
-import clrnet.utils.culane_metric as culane_metric
+import clrnet.utils.lanedet_metric as culane_metric
 import cv2
 from tqdm import tqdm
 import logging
@@ -11,33 +11,28 @@ import pickle as pkl
 
 LIST_FILE = {
     # "train": "list/train_gt.txt",
-    "train": "list/train.txt",  # ! TODO debug, temp for val
+    "train": "list/train.txt",
     "val": "list/val.txt",
-    "test": "list/test.txt",
+    "test": "list/test.txt",  # ! currently not available
 }
 
-CATEGORYS = {
-    "normal": "list/test_split/test0_normal.txt",
-    "crowd": "list/test_split/test1_crowd.txt",
-    "hlight": "list/test_split/test2_hlight.txt",
-    "shadow": "list/test_split/test3_shadow.txt",
-    "noline": "list/test_split/test4_noline.txt",
-    "arrow": "list/test_split/test5_arrow.txt",
-    "curve": "list/test_split/test6_curve.txt",
-    "cross": "list/test_split/test7_cross.txt",
-    "night": "list/test_split/test8_night.txt",
-}
+
+IMAGE_SIZE = (720, 1280)
+SAMPLE_Y = range(710, 150, -10)
+MAX_LANES = 4
 
 
 @DATASETS.register_module
-class CULane(BaseDataset):
+class LaneDataset(BaseDataset):
     def __init__(
         self,
+        dataset_name,
         data_root,
         split,
-        ori_img_size,
-        sample_y=range(589, 230, -20),
+        ori_img_size=IMAGE_SIZE,
+        sample_y=SAMPLE_Y,
         processes=None,
+        is_training=False,
         cfg=None,
     ):
         super().__init__(
@@ -46,53 +41,40 @@ class CULane(BaseDataset):
             ori_img_size,
             sample_y=sample_y,
             processes=processes,
+            is_training=is_training,
             cfg=cfg,
         )
+        self.dataset_name = dataset_name
         self.list_path = osp.join(data_root, LIST_FILE[split])
         self.split = split
+        self.max_lanes = MAX_LANES
         self.load_annotations()
 
     def load_annotations(self):
-        self.logger.info("Loading CULane annotations...")
+        self.logger.info(f"Loading {self.dataset_name} - {self.split} annotations...")
         # Waiting for the dataset to load is tedious, let's cache it
         os.makedirs("cache", exist_ok=True)
-        cache_path = "cache/culane_{}.pkl".format(self.split)
+        cache_path = f"cache/{self.dataset_name}_{self.split}.pkl"
         if os.path.exists(cache_path):
             with open(cache_path, "rb") as cache_file:
                 self.data_infos = pkl.load(cache_file)
-                self.max_lanes = max(len(anno["lanes"]) for anno in self.data_infos)
                 return
 
+        # when cache not exists, load from list file
         self.data_infos = []
         with open(self.list_path) as list_file:
             for line in list_file:
-                infos = self.load_annotation(line.split())
+                infos = self.load_annotation(line)
                 self.data_infos.append(infos)
 
         # cache data infos to file
         with open(cache_path, "wb") as cache_file:
             pkl.dump(self.data_infos, cache_file)
 
-    def load_annotation(self, line):
-        infos = {}
-        img_line = line[0]
-        img_line = img_line[1 if img_line[0] == "/" else 0 : :]
-        img_path = os.path.join(self.data_root, img_line)
-        infos["img_name"] = img_line
-        infos["img_path"] = img_path
-        if len(line) > 1:
-            mask_line = line[1]
-            mask_line = mask_line[1 if mask_line[0] == "/" else 0 : :]
-            mask_path = os.path.join(self.data_root, mask_line)
-            infos["mask_path"] = mask_path
+    def load_line_txt(self, path):
+        with open(path, "r") as f:
+            data = [list(map(float, line.split())) for line in f.readlines()]
 
-        if len(line) > 2:
-            exist_list = [int(l) for l in line[2:]]
-            infos["lane_exist"] = np.array(exist_list)
-
-        anno_path = img_path[:-3] + "lines.txt"  # remove sufix jpg and add lines.txt
-        with open(anno_path, "r") as anno_file:
-            data = [list(map(float, line.split())) for line in anno_file.readlines()]
         lanes = [
             [
                 (lane[i], lane[i + 1])
@@ -107,12 +89,24 @@ class CULane(BaseDataset):
         ]  # remove lanes with less than 2 points
 
         lanes = [sorted(lane, key=lambda x: x[1]) for lane in lanes]  # sort by y
-        infos["lanes"] = lanes
+        return lanes
+
+    def load_annotation(self, line):
+        infos = {}
+        line = line.split()
+        img_path = os.path.join(self.data_root, line[0])
+        label_path = os.path.join(self.data_root, line[1])
+        seg_path = os.path.join(self.data_root, line[2])
+
+        infos["img_name"] = line[0]
+        infos["img_path"] = img_path
+        infos["lanes"] = self.load_line_txt(label_path)
+        infos["mask_path"] = seg_path
 
         return infos
 
     def get_prediction_string(self, pred):
-        ys = np.arange(270, 590, 8) / self.ori_img_h
+        ys = np.arange(710, 150, -10) / self.ori_img_h
         out = []
         for lane in pred:
             xs = lane(ys)
@@ -130,7 +124,7 @@ class CULane(BaseDataset):
         return "\n".join(out)
 
     def get_prediction_arr(self, pred):
-        ys = np.arange(270, 590, 8) / self.ori_img_h
+        ys = np.arange(710, 150, -10) / self.ori_img_h
         out = []
         for lane in pred:
             xs = lane(ys)
@@ -151,7 +145,7 @@ class CULane(BaseDataset):
         return out
 
     def get_lane_arr(self, lane):
-        ys = np.arange(270, 590, 8) / self.ori_img_h
+        ys = np.arange(710, 150, -10) / self.ori_img_h
         xs = lane(ys)
         valid_mask = (xs >= 0) & (xs < 1)
         xs = xs * self.ori_img_w
@@ -180,6 +174,9 @@ class CULane(BaseDataset):
             output_dir = os.path.join(
                 output_basedir, os.path.dirname(self.data_infos[idx]["img_name"])
             )
+            output_dir = os.path.join(
+                os.path.dirname(output_dir), "label"
+            )  # ! notice for the lanedataset only
             output_filename = (
                 os.path.basename(self.data_infos[idx]["img_name"])[:-3] + "lines.txt"
             )
@@ -188,16 +185,6 @@ class CULane(BaseDataset):
 
             with open(os.path.join(output_dir, output_filename), "w") as out_file:
                 out_file.write(output)
-
-        # for cate, cate_file in CATEGORYS.items():
-        #     result = culane_metric.eval_predictions(
-        #         output_basedir,
-        #         self.data_root,
-        #         os.path.join(self.data_root, cate_file),
-        #         iou_thresholds=[0.5],
-        #         official=True,
-        #         cfg=self.cfg,
-        #     )
 
         result = culane_metric.eval_predictions(
             output_basedir,

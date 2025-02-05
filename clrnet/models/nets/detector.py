@@ -15,8 +15,8 @@ class Detector(nn.Module):
         self.neck = build_necks(cfg) if cfg.haskey('neck') else None
         self.heads = build_heads(cfg)
     
-    def get_lanes(self):
-        return self.heads.get_lanes(output)
+    # def get_lanes(self):
+    #     return self.heads.get_lanes(output)
 
     def forward(self, batch):
         output = {}
